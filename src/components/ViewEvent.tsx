@@ -2,11 +2,11 @@ import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { ListObjectsV2Command, DeleteObjectCommand } from '@aws-sdk/client-s3';
 import { Upload } from '@aws-sdk/lib-storage';
 import { s3Client, S3_BUCKET_NAME, rekognitionClient } from '../config/aws';
-import { Camera, X, ArrowLeft, Download, Trash2, Upload as UploadIcon, Copy } from 'lucide-react';
+import { Camera, X, ArrowLeft, Download, Upload as UploadIcon, Copy } from 'lucide-react';
 import { QRCodeSVG } from 'qrcode.react';
 import {
   IndexFacesCommand,
-  SearchFacesByImageCommand,
+  SearchFacesCommand,
   CreateCollectionCommand,
   ListCollectionsCommand
 } from '@aws-sdk/client-rekognition';
@@ -23,8 +23,14 @@ interface EventImage {
   key: string;
 }
 
+interface FaceRecordWithImage {
+  faceId: string;
+  boundingBox?: { [key: string]: number };
+  image: EventImage;
+}
+
 interface FaceGroups {
-  [key: string]: EventImage[];
+  [groupId: string]: FaceRecordWithImage[];
 }
 
 const ViewEvent: React.FC<ViewEventProps> = ({ eventId, selectedEvent, onEventSelect }) => {
@@ -38,7 +44,14 @@ const ViewEvent: React.FC<ViewEventProps> = ({ eventId, selectedEvent, onEventSe
   const [uploadProgress, setUploadProgress] = useState(0);
   const [showCopySuccess, setShowCopySuccess] = useState(false);
   const [showQRModal, setShowQRModal] = useState(false);
+
+  // We'll store face grouping differently now:
+  //  - "faceIdToGroupId" maps each Rekognition FaceId to a "group ID" we define.
+  //  - "faceGroups" is the final grouping of faces by groupId.
   const [faceGroups, setFaceGroups] = useState<FaceGroups>({});
+
+  // This holds all face records from Phase 1:
+  const [allFaceRecords, setAllFaceRecords] = useState<FaceRecordWithImage[]>([]);
 
   // Ref for the QR code element.
   const qrCodeRef = useRef<SVGSVGElement>(null);
@@ -66,13 +79,22 @@ const ViewEvent: React.FC<ViewEventProps> = ({ eventId, selectedEvent, onEventSe
       });
       await s3Client.send(deleteCommand);
       setImages(prev => prev.filter(img => img.key !== image.key));
+      // Also remove any face records belonging to this image from faceGroups:
       setFaceGroups(prev => {
-        const newGroups = { ...prev };
-        for (const [groupId, imgs] of Object.entries(newGroups)) {
-          newGroups[groupId] = imgs.filter(img => img.key !== image.key);
+        const newGroups: FaceGroups = {};
+        for (const [groupId, faceRecs] of Object.entries(prev)) {
+          newGroups[groupId] = faceRecs.filter(fr => fr.image.key !== image.key);
+        }
+        // You might also want to remove empty groups:
+        for (const groupId of Object.keys(newGroups)) {
+          if (newGroups[groupId].length === 0) {
+            delete newGroups[groupId];
+          }
         }
         return newGroups;
       });
+      // Also remove from allFaceRecords:
+      setAllFaceRecords(prev => prev.filter(fr => fr.image.key !== image.key));
     } catch (error) {
       console.error('Error deleting image:', error);
     } finally {
@@ -81,77 +103,124 @@ const ViewEvent: React.FC<ViewEventProps> = ({ eventId, selectedEvent, onEventSe
   }, []);
 
   /**
-   * For each image, we search for similar faces and index them concurrently.
-   * Then we group images by their assigned ExternalImageId (group ID).
+   * detectAndGroupFaces: two-phase approach
+   *
+   * PHASE 1: Index each image. If multiple faces exist, Rekognition returns multiple FaceRecords.
+   *          We store them in "allFaceRecords".
+   *
+   * PHASE 2: For each faceRecord, call SearchFaces by faceId to see if it matches existing faces.
+   *          If matched, reuse groupId; if not, create a new groupId. Then build "faceGroups".
    */
-  const detectAndGroupFaces = async (images: EventImage[]) => {
-    const collectionId = eventId; // Use eventId as the collection identifier.
+  const detectAndGroupFaces = async (imagesToProcess: EventImage[]) => {
+    const collectionId = eventId;
     await ensureCollection(collectionId);
 
-    // Process images in parallel.
-    const results = await Promise.all(
-      images.map(async (image) => {
-        let groupId = '';
+    // Temporary array to store all face records from indexing:
+    const tempFaceRecords: FaceRecordWithImage[] = [];
+
+    // ---- PHASE 1: INDEX ALL IMAGES ----
+    // Concurrency: Index all images in parallel.
+    await Promise.all(
+      imagesToProcess.map(async (image) => {
         try {
-          const searchCommand = new SearchFacesByImageCommand({
-            CollectionId: collectionId,
-            Image: {
-              S3Object: {
-                Bucket: S3_BUCKET_NAME,
-                Name: image.key
+          // We can pass a placeholder ExternalImageId or omit it.
+          // If multiple faces are found, they'll all share the same ExternalImageId.
+          // We'll do the grouping ourselves with FaceId, so it's fine.
+          const indexResponse = await rekognitionClient.send(
+            new IndexFacesCommand({
+              CollectionId: collectionId,
+              Image: {
+                S3Object: {
+                  Bucket: S3_BUCKET_NAME,
+                  Name: image.key
+                }
+              },
+              DetectionAttributes: [],
+              // Provide a placeholder or sanitized ID:
+              ExternalImageId: 'placeholder'
+            })
+          );
+
+          if (indexResponse.FaceRecords) {
+            // For each face in this image, store the faceId & bounding box with the image reference.
+            for (const rec of indexResponse.FaceRecords) {
+              if (rec.Face?.FaceId) {
+                tempFaceRecords.push({
+                  faceId: rec.Face.FaceId,
+                  boundingBox: rec.Face.BoundingBox,
+                  image
+                });
               }
-            },
-            FaceMatchThreshold: 80,
-            MaxFaces: 10
-          });
-          const searchResponse = await rekognitionClient.send(searchCommand);
-          if (searchResponse.FaceMatches && searchResponse.FaceMatches.length > 0) {
-            const match = searchResponse.FaceMatches.find(
-              (m) => m.Face && m.Face.ExternalImageId && m.Face.ExternalImageId !== image.key
-            );
-            if (match) {
-              groupId = match.Face.ExternalImageId;
             }
           }
         } catch (error) {
-          console.error(`SearchFacesByImage error for image ${image.key}:`, error);
-        }
-
-        // If no match was found, generate a new group ID.
-        if (!groupId) {
-          groupId = `group_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
-        }
-
-        try {
-          const indexCommand = new IndexFacesCommand({
-            CollectionId: collectionId,
-            Image: {
-              S3Object: {
-                Bucket: S3_BUCKET_NAME,
-                Name: image.key
-              }
-            },
-            ExternalImageId: groupId,
-            DetectionAttributes: []
-          });
-          await rekognitionClient.send(indexCommand);
-        } catch (error) {
           console.error(`Error indexing image ${image.key}:`, error);
         }
-
-        return { key: image.key, groupId };
       })
     );
 
-    // Build groups from the results.
-    const groups: FaceGroups = {};
-    for (const image of images) {
-      const result = results.find(r => r.key === image.key);
-      const gid = result ? result.groupId : 'unknown';
-      if (!groups[gid]) groups[gid] = [];
-      groups[gid].push(image);
+    // Store them in state for reference if needed:
+    setAllFaceRecords(tempFaceRecords);
+
+    // ---- PHASE 2: SEARCH & GROUP ----
+    // We'll keep a local map: faceId -> groupId
+    const faceIdToGroupId: Record<string, string> = {};
+    // We'll keep track of groupId increments:
+    let groupCount = 0;
+
+    // Concurrency: For each faceRecord, we do a search by faceId.
+    await Promise.all(
+      tempFaceRecords.map(async (faceRec) => {
+        try {
+          const searchResponse = await rekognitionClient.send(
+            new SearchFacesCommand({
+              CollectionId: collectionId,
+              FaceId: faceRec.faceId,
+              MaxFaces: 5,
+              FaceMatchThreshold: 80
+            })
+          );
+          if (searchResponse.FaceMatches && searchResponse.FaceMatches.length > 0) {
+            // We found matches, see if any matched faceId is already in faceIdToGroupId
+            const matchedGroupIds = searchResponse.FaceMatches
+              .map((m) => m.Face?.FaceId)
+              .filter((id): id is string => !!id)
+              .map((id) => faceIdToGroupId[id]) // might be undefined if we haven't assigned it yet
+              .filter((gid): gid is string => !!gid);
+
+            if (matchedGroupIds.length > 0) {
+              // Use the first matched group ID
+              faceIdToGroupId[faceRec.faceId] = matchedGroupIds[0];
+            } else {
+              // No matched faceId is in our map yet, so we create a new group ID
+              groupCount += 1;
+              faceIdToGroupId[faceRec.faceId] = `group_${groupCount}`;
+            }
+          } else {
+            // No matches found => new group
+            groupCount += 1;
+            faceIdToGroupId[faceRec.faceId] = `group_${groupCount}`;
+          }
+        } catch (err) {
+          console.error(`SearchFaces error for faceId ${faceRec.faceId}:`, err);
+          // fallback group
+          groupCount += 1;
+          faceIdToGroupId[faceRec.faceId] = `group_${groupCount}`;
+        }
+      })
+    );
+
+    // Now build the final FaceGroups structure from faceIdToGroupId
+    const newGroups: FaceGroups = {};
+    for (const faceRec of tempFaceRecords) {
+      const gid = faceIdToGroupId[faceRec.faceId];
+      if (!newGroups[gid]) {
+        newGroups[gid] = [];
+      }
+      newGroups[gid].push(faceRec);
     }
-    setFaceGroups(groups);
+
+    setFaceGroups(newGroups);
   };
 
   useEffect(() => {
@@ -183,6 +252,7 @@ const ViewEvent: React.FC<ViewEventProps> = ({ eventId, selectedEvent, onEventSe
       const prefixes = [`events/shared/${eventToUse}/images`];
       let allImages: EventImage[] = [];
       let fetchError: any = null;
+
       for (const prefix of prefixes) {
         try {
           const listCommand = new ListObjectsV2Command({
@@ -205,8 +275,10 @@ const ViewEvent: React.FC<ViewEventProps> = ({ eventId, selectedEvent, onEventSe
           continue;
         }
       }
+
       if (allImages.length > 0) {
         setImages(allImages);
+        // Once we have the images, do the detection & grouping:
         await detectAndGroupFaces(allImages);
         setError(null);
       } else if (fetchError) {
@@ -227,14 +299,17 @@ const ViewEvent: React.FC<ViewEventProps> = ({ eventId, selectedEvent, onEventSe
     if (!e.target.files || e.target.files.length === 0) return;
     const userEmail = localStorage.getItem('userEmail');
     if (!userEmail) throw new Error('User not authenticated');
+
     setUploading(true);
     const files = Array.from(e.target.files);
+
     try {
-      // Process each file sequentially or in parallel as needed.
+      // Upload each file concurrently
       await Promise.all(files.map(async (file) => {
         const key = `events/shared/${eventId}/images/${Date.now()}-${file.name}`;
         const buffer = await file.arrayBuffer();
         const uint8Array = new Uint8Array(buffer);
+
         const upload = new Upload({
           client: s3Client,
           params: {
@@ -251,16 +326,17 @@ const ViewEvent: React.FC<ViewEventProps> = ({ eventId, selectedEvent, onEventSe
           partSize: 5 * 1024 * 1024,
           leavePartsOnError: false
         });
+
         upload.on('httpUploadProgress', (progress) => {
           const percentage = Math.round((progress.loaded || 0) * 100 / (progress.total || 1));
           setUploadProgress(percentage);
         });
+
         await upload.done();
       }));
-      // Instead of re-fetching all images, you might merge new images into state.
+
+      // Refresh the images & re-run face grouping
       await fetchEventImages();
-      // Re-run face grouping after new uploads.
-      await detectAndGroupFaces(images);
     } catch (error: any) {
       console.error('Error uploading images:', error);
       setError(error.message || 'Failed to upload images. Please try again.');
@@ -268,8 +344,9 @@ const ViewEvent: React.FC<ViewEventProps> = ({ eventId, selectedEvent, onEventSe
       setUploading(false);
       setUploadProgress(0);
     }
-  }, [eventId, images]);
+  }, [eventId]);
 
+  // ---------- RENDERING ----------
   if (loading) {
     return (
       <div className="flex items-center justify-center min-h-screen bg-gray-50">
@@ -354,7 +431,8 @@ const ViewEvent: React.FC<ViewEventProps> = ({ eventId, selectedEvent, onEventSe
                               const ctx = canvas.getContext('2d');
                               ctx!.drawImage(img, 0, 0);
                               canvas.toBlob((blob) => {
-                                const url = URL.createObjectURL(blob!);
+                                if (!blob) return;
+                                const url = URL.createObjectURL(blob);
                                 const a = document.createElement('a');
                                 a.href = url;
                                 a.download = `selfie-upload-qr-${eventId}.png`;
@@ -434,86 +512,57 @@ const ViewEvent: React.FC<ViewEventProps> = ({ eventId, selectedEvent, onEventSe
           </div>
         )}
 
+        {/* 
+          Now we display face groups. Each group can have multiple faces from multiple images.
+          If multiple people appear in the same image, you'll see them in separate face groups
+          because each face has a unique FaceId => group mapping.
+        */}
         <div className="space-y-8">
-          {Object.entries(faceGroups).map(([groupId, groupImages]) => (
-            <div key={groupId} className="space-y-4 bg-gray-50 p-4 rounded-lg">
-              <div className="flex justify-between items-center">
-                <h3 className="text-xl font-semibold text-gray-700">
-                  Face Group 
-                  <span className="text-sm font-normal text-gray-500 ml-2">({groupImages.length} photos)</span>
-                </h3>
-              </div>
-              <div className="grid grid-cols-1 xs:grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6 gap-2 sm:gap-4">
-                {groupImages.map((image, index) => (
-                  <div
-                    key={image.key}
-                    className="relative aspect-square overflow-hidden rounded-lg shadow-md hover:shadow-xl transition-all duration-200 cursor-pointer group"
-                    onClick={() => setSelectedImage(image)}
-                  >
-                    <img
-                      src={image.url}
-                      alt={`Face ${index + 1} in group ${groupId}`}
-                      className="w-full h-full object-cover"
-                    />
-                    <div className="absolute inset-0 bg-black bg-opacity-0 group-hover:bg-opacity-40 transition-all duration-200 flex items-center justify-center gap-2 opacity-0 group-hover:opacity-100">
-                      <button
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          const a = document.createElement('a');
-                          a.href = image.url;
-                          a.download = image.key.split('/').pop() || 'image';
-                          document.body.appendChild(a);
-                          a.click();
-                          document.body.removeChild(a);
-                        }}
-                        className="p-2 bg-white rounded-full hover:bg-gray-100 transition-colors"
-                      >
-                        <Download className="w-4 h-4 text-gray-800" />
-                      </button>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            </div>
-          ))}
+          {Object.entries(faceGroups).map(([groupId, faceRecs]) => {
+            // We'll gather unique images for this group.
+            // If you want to show face bounding boxes or thumbnails, you'd do so here.
+            const uniqueImages = Array.from(
+              new Set(faceRecs.map(fr => fr.image.key))
+            ).map(key => images.find(img => img.key === key));
 
-          <div className="space-y-4">
-            <h3 className="text-xl font-semibold text-gray-700">Other Images</h3>
-            <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6 gap-4">
-              {images.filter(image => !Object.values(faceGroups).flat().includes(image)).map((image, index) => (
-                <div
-                  key={image.key}
-                  className="relative aspect-square overflow-hidden rounded-lg shadow-lg cursor-pointer transform hover:scale-105 transition-transform duration-300"
-                  onClick={() => setSelectedImage(image)}
-                >
-                  <img
-                    src={image.url}
-                    alt={`Event image ${index + 1}`}
-                    className="w-full h-full object-cover"
-                    loading="lazy"
-                  />
-                  <div className="absolute inset-0 bg-black bg-opacity-0 group-hover:bg-opacity-40 transition-all duration-200 flex items-center justify-center gap-2 opacity-0 group-hover:opacity-100">
-                    <button
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        const a = document.createElement('a');
-                        a.href = image.url;
-                        a.download = image.key.split('/').pop() || 'image';
-                        document.body.appendChild(a);
-                        a.click();
-                        document.body.removeChild(a);
-                      }}
-                      className="p-2 bg-white rounded-full hover:bg-gray-100 transition-colors duration-200"
-                    >
-                      <Download className="w-5 h-5 text-gray-700" />
-                    </button>
-                  </div>
+            return (
+              <div key={groupId} className="space-y-4 bg-gray-50 p-4 rounded-lg">
+                <div className="flex justify-between items-center">
+                  <h3 className="text-xl font-semibold text-gray-700">
+                    Face Group {groupId}
+                    <span className="text-sm font-normal text-gray-500 ml-2">
+                      ({faceRecs.length} face record{faceRecs.length !== 1 ? 's' : ''})
+                    </span>
+                  </h3>
                 </div>
-              ))}
-            </div>
-          </div>
+                <p className="text-gray-500 text-sm">
+                  Found in {uniqueImages.filter(Boolean).length} image(s).
+                </p>
+                <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6 gap-4">
+                  {uniqueImages.map((img, idx) => {
+                    if (!img) return null;
+                    return (
+                      <div
+                        key={img.key}
+                        className="relative aspect-square overflow-hidden rounded-lg shadow-md cursor-pointer transform hover:scale-105 transition-transform duration-300"
+                        onClick={() => setSelectedImage(img)}
+                      >
+                        <img
+                          src={img.url}
+                          alt={`Group ${groupId}, image ${idx + 1}`}
+                          className="w-full h-full object-cover"
+                          loading="lazy"
+                        />
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            );
+          })}
         </div>
 
+        {/* If no images, show empty state */}
         {images.length === 0 && (
           <div className="text-center py-16 bg-gray-50 rounded-lg">
             <Camera className="w-16 h-16 text-gray-400 mx-auto mb-4" />
